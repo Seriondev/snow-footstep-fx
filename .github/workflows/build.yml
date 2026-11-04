@@ -1,0 +1,353 @@
+name: Build Footstep Snow FX
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compile Minecraft 1.21.10 Fabric mod
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Generate the complete mod project from this workflow
+        shell: bash
+        run: |
+          mkdir -p src/main/java/dev/footstepsnowfx src/main/resources
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  gradlePluginPortal()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'footstepsnowfx'
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          minecraft_version=1.21.10
+          yarn_mappings=1.21.10+build.3
+          loader_version=0.17.2
+          fabric_api_version=0.138.4+1.21.10
+          mod_version=1.0.0
+          maven_group=dev.footstepsnowfx
+          archives_base_name=footstepsnowfx
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.11.8'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property 'version', project.version
+              filesMatching('fabric.mod.json') {
+                  expand 'version': project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 21
+              options.encoding = 'UTF-8'
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+              withSourcesJar()
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "footstepsnowfx",
+            "version": "${version}",
+            "name": "Footstep Snow FX",
+            "description": "Client-side snowflake particles that trail the player's footsteps.",
+            "environment": "client",
+            "entrypoints": {
+              "client": [
+                "dev.footstepsnowfx.FootstepSnowFxClient"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.17.2",
+              "minecraft": "1.21.10",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/java/dev/footstepsnowfx/FootstepSnowFxClient.java <<'EOF'
+          package dev.footstepsnowfx;
+
+          import java.io.BufferedReader;
+          import java.io.BufferedWriter;
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Properties;
+          import java.util.concurrent.ThreadLocalRandom;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.particle.ParticleTypes;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          public final class FootstepSnowFxClient implements ClientModInitializer {
+              private static KeyBinding openSettingsKey;
+              private static boolean enabled = true;
+              private static int density = 3;
+              private static Path configPath;
+
+              private static double lastX = Double.NaN;
+              private static double lastZ = Double.NaN;
+              private static double travelledSinceStep = 0.0;
+              private static int nextFoot = 1;
+
+              @Override
+              public void onInitializeClient() {
+                  configPath = FabricLoader.getInstance().getConfigDir().resolve("footstepsnowfx.properties");
+                  loadConfig();
+
+                  openSettingsKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                      "key.footstepsnowfx.open_settings",
+                      InputUtil.Type.KEYSYM,
+                      GLFW.GLFW_KEY_RIGHT_SHIFT,
+                      KeyBinding.MISC_CATEGORY
+                  ));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(FootstepSnowFxClient::onClientTick);
+              }
+
+              private static void onClientTick(MinecraftClient client) {
+                  if (openSettingsKey.wasPressed() && client.currentScreen == null) {
+                      client.setScreen(new SnowSettingsScreen());
+                  }
+
+                  if (client.player == null || client.world == null) {
+                      lastX = Double.NaN;
+                      lastZ = Double.NaN;
+                      travelledSinceStep = 0.0;
+                      return;
+                  }
+
+                  double x = client.player.getX();
+                  double z = client.player.getZ();
+
+                  if (Double.isNaN(lastX) || Double.isNaN(lastZ)) {
+                      lastX = x;
+                      lastZ = z;
+                      return;
+                  }
+
+                  double dx = x - lastX;
+                  double dz = z - lastZ;
+                  lastX = x;
+                  lastZ = z;
+
+                  if (!enabled || !client.player.isOnGround() || client.currentScreen != null) {
+                      travelledSinceStep = 0.0;
+                      return;
+                  }
+
+                  double distance = Math.sqrt(dx * dx + dz * dz);
+                  if (distance < 0.0001) {
+                      return;
+                  }
+
+                  travelledSinceStep += distance;
+                  while (travelledSinceStep >= 0.28) {
+                      travelledSinceStep -= 0.28;
+                      emitFootstepSnow(client, x, client.player.getY(), z, dx / distance, dz / distance);
+                  }
+              }
+
+              private static void emitFootstepSnow(MinecraftClient client, double x, double y, double z,
+                                                   double directionX, double directionZ) {
+                  ThreadLocalRandom random = ThreadLocalRandom.current();
+                  double side = 0.12 * nextFoot;
+                  nextFoot = -nextFoot;
+
+                  double footX = x - directionZ * side - directionX * 0.10;
+                  double footZ = z + directionX * side - directionZ * 0.10;
+
+                  int particleCount = density + 1;
+                  for (int i = 0; i < particleCount; i++) {
+                      double offsetX = random.nextDouble(-0.075, 0.075);
+                      double offsetZ = random.nextDouble(-0.075, 0.075);
+                      double velocityX = random.nextDouble(-0.012, 0.012);
+                      double velocityZ = random.nextDouble(-0.012, 0.012);
+                      double velocityY = random.nextDouble(0.006, 0.025);
+
+                      client.world.addParticleClient(
+                          ParticleTypes.SNOWFLAKE,
+                          footX + offsetX,
+                          y + 0.045,
+                          footZ + offsetZ,
+                          velocityX,
+                          velocityY,
+                          velocityZ
+                      );
+                  }
+              }
+
+              private static void loadConfig() {
+                  if (configPath == null || !Files.exists(configPath)) {
+                      return;
+                  }
+
+                  Properties properties = new Properties();
+                  try (BufferedReader reader = Files.newBufferedReader(configPath)) {
+                      properties.load(reader);
+                      enabled = Boolean.parseBoolean(properties.getProperty("enabled", "true"));
+                      density = clampDensity(Integer.parseInt(properties.getProperty("density", "3")));
+                  } catch (IOException | NumberFormatException exception) {
+                      System.err.println("[Footstep Snow FX] Could not read config: " + exception.getMessage());
+                  }
+              }
+
+              private static void saveConfig() {
+                  if (configPath == null) {
+                      return;
+                  }
+
+                  Properties properties = new Properties();
+                  properties.setProperty("enabled", Boolean.toString(enabled));
+                  properties.setProperty("density", Integer.toString(density));
+
+                  try {
+                      Files.createDirectories(configPath.getParent());
+                      try (BufferedWriter writer = Files.newBufferedWriter(configPath)) {
+                          properties.store(writer, "Footstep Snow FX settings");
+                      }
+                  } catch (IOException exception) {
+                      System.err.println("[Footstep Snow FX] Could not save config: " + exception.getMessage());
+                  }
+              }
+
+              private static int clampDensity(int value) {
+                  return Math.max(1, Math.min(5, value));
+              }
+
+              private static Text enabledButtonText() {
+                  return Text.literal("Snow effect: " + (enabled ? "ON" : "OFF"));
+              }
+
+              private static Text densityButtonText() {
+                  return Text.literal("Particle density: " + density + "/5");
+              }
+
+              private static final class SnowSettingsScreen extends Screen {
+                  private SnowSettingsScreen() {
+                      super(Text.literal("Footstep Snow FX"));
+                  }
+
+                  @Override
+                  protected void init() {
+                      int center = this.width / 2;
+
+                      this.addDrawableChild(ButtonWidget.builder(enabledButtonText(), button -> {
+                          enabled = !enabled;
+                          button.setMessage(enabledButtonText());
+                          saveConfig();
+                      }).dimensions(center - 100, this.height / 2 - 24, 200, 20).build());
+
+                      this.addDrawableChild(ButtonWidget.builder(densityButtonText(), button -> {
+                          density = density >= 5 ? 1 : density + 1;
+                          button.setMessage(densityButtonText());
+                          saveConfig();
+                      }).dimensions(center - 100, this.height / 2 + 2, 200, 20).build());
+
+                      this.addDrawableChild(ButtonWidget.builder(Text.literal("Done"), button -> this.close())
+                          .dimensions(center - 100, this.height / 2 + 34, 200, 20).build());
+                  }
+
+                  @Override
+                  public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+                      this.renderBackground(context, mouseX, mouseY, delta);
+                      context.drawCenteredTextWithShadow(this.textRenderer, this.title,
+                          this.width / 2, this.height / 2 - 72, 0xFFFFFF);
+                      context.drawCenteredTextWithShadow(this.textRenderer,
+                          Text.literal("Snow particles appear behind each step."),
+                          this.width / 2, this.height / 2 - 48, 0xCFEAFF);
+                      super.render(context, mouseX, mouseY, delta);
+                  }
+
+                  @Override
+                  public void close() {
+                      if (this.client != null) {
+                          this.client.setScreen(null);
+                      }
+                  }
+
+                  @Override
+                  public boolean shouldPause() {
+                      return false;
+                  }
+              }
+          }
+          EOF
+
+      - name: Compile mod JAR
+        run: gradle --no-daemon build
+
+      - name: Upload compiled JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: footstep-snow-fx-mc1.21.10-fabric
+          path: build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 14
